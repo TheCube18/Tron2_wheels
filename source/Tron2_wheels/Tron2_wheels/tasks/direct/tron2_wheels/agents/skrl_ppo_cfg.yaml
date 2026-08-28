@@ -15,7 +15,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [256, 128, 64]
         activations: elu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [256, 128, 64]
         activations: elu
     output: ONE
 
@@ -59,14 +59,14 @@ agent:
   ratio_clip: 0.2
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.0
+  entropy_loss_scale: 0.005
   value_loss_scale: 2.0
   kl_threshold: 0.0
   rewards_shaper_scale: 0.1
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "cartpole_direct"
+    directory: "tron2_wheels_direct"
     experiment_name: ""
     write_interval: auto
     checkpoint_interval: auto
@@ -76,5 +76,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 4800
+  timesteps: 10000
   environment_info: log

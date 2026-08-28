@@ -43,7 +43,7 @@ params:
   load_path: '' # path to the checkpoint to load
 
   config:
-    name: cartpole_direct
+    name: tron2_wheels_direct
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
