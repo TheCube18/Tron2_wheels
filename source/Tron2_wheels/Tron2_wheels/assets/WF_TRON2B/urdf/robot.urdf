@@ -8,7 +8,7 @@
   <link name="base_Link">
     <inertial>
       <origin xyz="0.00241 -0.00022 0.11116" rpy="0.0 0.0 0.0"/>
-      <mass value="13.4"/>
+      <mass value="13.4"/> <!-- og mass 13.4 -->
       <inertia ixx="0.11544842" ixy="-6.32e-06" ixz="0.00636327" iyy="0.13779136" iyz="-2.76e-05" izz="0.10571445"/>
     </inertial>
     <visual>

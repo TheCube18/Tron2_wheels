@@ -14,10 +14,12 @@ from isaaclab.assets import Articulation
 from isaaclab.devices import Se2Keyboard, Se2KeyboardCfg
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, Imu
 from isaaclab.sim.spawners.from_files import spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import quat_apply_yaw, quat_from_angle_axis, sample_uniform
+
+from Tron2_wheels.assets.tron2 import tron2_balanced_stance_table
 
 from .tron2_wheels_env_cfg import Tron2WheelsEnvCfg
 
@@ -55,7 +57,7 @@ class Tron2WheelsEnv(DirectRLEnv):
         self._previous_actions = torch.zeros_like(self.actions)
 
         #commands - filled per env by _resample_commands on every reset
-        self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+        self._commands = torch.zeros(self.num_envs, 5, device=self.device)
 
         # keyboard teleop. when active it overwrites the command every step, so the random
         # resampling on reset is skipped and every env follows the same typed command.
@@ -79,6 +81,7 @@ class Tron2WheelsEnv(DirectRLEnv):
                 f"\n  Up / Down    : drive forward / back  (+-{self.cfg.keyboard_v_x_sensitivity} m/s)"
                 f"\n  Left / Right : turn                  (+-{yaw} rad/s)"
                 "\n  Z / X        : turn, same as Left / Right"
+                "\n  K            : toggle stance, stand <-> crouch"
                 "\n  L            : zero the command\n"
             )
 
@@ -86,8 +89,34 @@ class Tron2WheelsEnv(DirectRLEnv):
         self._wheel_vel_targets = torch.zeros(self.num_envs, self._num_wheel_dof, device=self.device)
 
 
-        # The nominal stance the leg actions are offsets from.
+        # The nominal stance the leg actions are offsets from. Rewritten every step from the
+        # commanded height, so the observation, the pose reward and the leg targets all read
+        # the same stance.
         self._default_leg_pos = self.robot.data.default_joint_pos[:, self._leg_dof_idx].clone()
+
+        # height -> (pitch, knee) with the COM over the wheel contact at every stance
+        pitch_np, knee_np, height_np = tron2_balanced_stance_table(
+            self.cfg.height_lut_size, self.cfg.height_lut_max_pitch
+        )
+        self._lut_pitch = torch.tensor(pitch_np, dtype=torch.float32, device=self.device)
+        self._lut_knee = torch.tensor(knee_np, dtype=torch.float32, device=self.device)
+        self._lut_height = torch.tensor(height_np, dtype=torch.float32, device=self.device)
+
+        # which columns of the 8 leg joints carry pitch and knee
+        self._pitch_cols = [i for i, n in enumerate(self.cfg.leg_joint_names) if "pitch" in n]
+        self._knee_cols = [i for i, n in enumerate(self.cfg.leg_joint_names) if "knee" in n]
+
+        tall = self.cfg.height_command_range[1]
+        self._height_now = torch.full((self.num_envs,), tall, device=self.device)
+        self._height_goal = self._height_now.clone()
+        self._height_resample_at = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_resample_at = torch.zeros(self.num_envs, device=self.device)
+        self._stand_tall = True
+
+        # registered here rather than with the other bindings, so the height state it writes
+        # to already exists
+        if self._keyboard is not None:
+            self._keyboard.add_callback("K", self._toggle_stance)
 
         self._markers = None
         if self.cfg.debug_arrow and self.sim.has_gui():
@@ -95,17 +124,17 @@ class Tron2WheelsEnv(DirectRLEnv):
                 prim_path="/Visuals/tron2_markers",
                 markers={
                     # 0 - direction the robot is actually travelling, CYAN
-                    "actual": sim_utils.UsdFileCfg(
-                        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
-                        scale=(0.15, 0.15, 0.3),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
-                    ),
-                    # 1 - direction it was commanded to travel, RED
-                    "target": sim_utils.UsdFileCfg(
-                        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
-                        scale=(0.15, 0.15, 0.3),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
-                    ),
+                        "actual": sim_utils.UsdFileCfg(
+                            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                            scale=(0.15, 0.15, 0.3),
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
+                        ),
+                        # 1 - direction it was commanded to travel, RED
+                        "target": sim_utils.UsdFileCfg(
+                            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                            scale=(0.15, 0.15, 0.3),
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                        ),
                 },
             )
             self._markers = VisualizationMarkers(marker_cfg)
@@ -117,6 +146,7 @@ class Tron2WheelsEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         self.contact_sensor = ContactSensor(self.cfg.contact_sensor_cfg)
+        self.imu = Imu(self.cfg.imu_cfg)
         
         spawn_ground_plane(prim_path="/World/ground", cfg=self.cfg.ground_cfg)
         self.scene.clone_environments(copy_from_source=False)
@@ -127,13 +157,37 @@ class Tron2WheelsEnv(DirectRLEnv):
 
         self.scene.articulations["robot"] = self.robot
         self.scene.sensors["contact_sensor"] = self.contact_sensor
+        self.scene.sensors["imu"] = self.imu
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         if self._keyboard is not None:
-            self._commands[:] = self._keyboard.advance()
+            self._commands[:, :3] = self._keyboard.advance()
+        else:
+            # redraw height goals on the interval so the transition is trained, not just the
+            # two endpoints. skipped under teleop, where the operator owns the goal.
+            elapsed = self.episode_length_buf.float() * self.step_dt
+            due = (elapsed >= self._height_resample_at).nonzero(as_tuple=False).flatten()
+            if due.numel() > 0:
+                self._resample_height_goal(due)
+
+            # same treatment for the velocity command. held fixed for a whole episode it
+            # never reverses mid-run, which is exactly the case teleop produces.
+            due_cmd = (elapsed >= self._cmd_resample_at).nonzero(as_tuple=False).flatten()
+            if due_cmd.numel() > 0:
+                self._resample_commands(due_cmd)
+
+        # ramp the stance toward its goal. a step change would put ~1 rad on the knee target
+        # in a single tick and slam a 200 Nm drive into a bot with no fore/aft support.
+        step = self.cfg.height_rate * self.step_dt
+        self._height_now += (self._height_goal - self._height_now).clamp(-step, step)
+        pitch, knee = self._stance_for_height(self._height_now)
+        self._default_leg_pos[:, self._pitch_cols] = pitch.unsqueeze(1)
+        self._default_leg_pos[:, self._knee_cols] = knee.unsqueeze(1)
+        self._commands[:, 3] = self._height_now
+        self._commands[:, 4] = self._height_goal
 
         self._previous_actions = self.actions
         self.actions = actions.clone().clamp(-self.cfg.action_clip, self.cfg.action_clip)
@@ -152,7 +206,23 @@ class Tron2WheelsEnv(DirectRLEnv):
 
 
     def _get_observations(self) -> dict:
-        obs = torch.cat(
+        obs_policy = torch.cat(
+            (
+                self.imu.data.ang_vel_b * self.cfg.obs_scale_ang_vel,
+                self.imu.data.projected_gravity_b,
+                self._commands,
+                # joints - wheel angles spin without bound, so only the legs report position
+                (self.robot.data.joint_pos[:, self._leg_dof_idx] - self._default_leg_pos)
+                * self.cfg.obs_scale_joint_pos,  
+
+
+                self.robot.data.joint_vel[:, self._all_dof_idx] * self.cfg.obs_scale_joint_vel,  
+                self.actions, 
+            ),
+            dim=-1,
+        )
+
+        obs_critic = torch.cat(
             (
                 self.robot.data.root_ang_vel_b * self.cfg.obs_scale_ang_vel, 
                 self.robot.data.projected_gravity_b, 
@@ -167,7 +237,10 @@ class Tron2WheelsEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-        return {"policy": obs}
+
+
+
+        return {"policy": obs_policy, "critic": obs_critic}
 
 
     def _get_rewards(self) -> torch.Tensor:
@@ -196,25 +269,21 @@ class Tron2WheelsEnv(DirectRLEnv):
             self.cfg.tracking_sigma_ang,
 
             self.robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2],
-            self.cfg.nominal_base_height,
+            self._commands[:, 3],
             self.cfg.rew_scale_height,
 
-            self._stance_width(),
-            self.cfg.stance_width_target,
-            self.cfg.stance_width_tolerance,
-            self.cfg.rew_scale_stance_width,
+
 
             self.robot.data.joint_pos[:, self._leg_dof_idx] - self._default_leg_pos,
             self.cfg.rew_scale_pose_match,
+
+            self.cfg.stand_still_cmd_threshold,
+            self.cfg.rew_scale_stand_still,
             )
 
         return total_reward
 
-    def _stance_width(self) -> torch.Tensor:
-        # straight-line distance between the wheel centres. taken in world frame on purpose:
-        # a distance is rotation invariant, so this reads the same however the base is leaning.
-        wheel_pos = self.robot.data.body_pos_w[:, self._wheel_body_idx]
-        return torch.norm(wheel_pos[:, 0] - wheel_pos[:, 1], dim=-1)
+
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -258,8 +327,40 @@ class Tron2WheelsEnv(DirectRLEnv):
         self.actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
 
+        # every episode starts standing, which keeps the spawn height in TRON2_CFG consistent
+        # with the stance. mid-episode resampling covers the rest of the range.
+        tall = self.cfg.height_command_range[1]
+        self._height_now[env_ids] = tall
+        self._height_goal[env_ids] = tall
+
         if self._keyboard is None:
             self._resample_commands(env_ids)
+            self._resample_height_goal(env_ids)
+
+    def _stance_for_height(self, height: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hip pitch and knee that hit this base height with the COM over the wheel."""
+        h = height.clamp(self._lut_height[0], self._lut_height[-1])
+        i = torch.searchsorted(self._lut_height, h).clamp(1, self._lut_height.numel() - 1)
+        h0, h1 = self._lut_height[i - 1], self._lut_height[i]
+        t = (h - h0) / (h1 - h0).clamp(min=1e-9)
+        pitch = self._lut_pitch[i - 1] + t * (self._lut_pitch[i] - self._lut_pitch[i - 1])
+        knee = self._lut_knee[i - 1] + t * (self._lut_knee[i] - self._lut_knee[i - 1])
+        return pitch, knee
+
+    def _resample_height_goal(self, env_ids: Sequence[int]) -> None:
+        """Draw a fresh stance height and schedule the next redraw."""
+        num = len(env_ids)
+        self._height_goal[env_ids] = sample_uniform(*self.cfg.height_command_range, (num,), self.device)
+        elapsed = self.episode_length_buf[env_ids].float() * self.step_dt
+        self._height_resample_at[env_ids] = elapsed + sample_uniform(
+            *self.cfg.height_resample_s, (num,), self.device
+        )
+
+    def _toggle_stance(self) -> None:
+        """Keyboard callback: flip between the two ends of the height range."""
+        self._stand_tall = not self._stand_tall
+        low, tall = self.cfg.height_command_range
+        self._height_goal[:] = tall if self._stand_tall else low
 
     def _resample_commands(self, env_ids: Sequence[int]) -> None:
         """Draw a fresh velocity command for the given envs."""
@@ -267,6 +368,17 @@ class Tron2WheelsEnv(DirectRLEnv):
         self._commands[env_ids, 0] = sample_uniform(*self.cfg.lin_vel_x_range, (num_resets,), self.device)
         self._commands[env_ids, 1] = sample_uniform(*self.cfg.lin_vel_y_range, (num_resets,), self.device)
         self._commands[env_ids, 2] = sample_uniform(*self.cfg.ang_vel_z_range, (num_resets,), self.device)
+
+        # zero a share of envs outright, so "hold still" is a trained behaviour rather than
+        # an interpolation between +-1 m/s that the policy almost never actually visits
+        stand = torch.rand(num_resets, device=self.device) < self.cfg.stand_still_prob
+        # only the velocity columns - zeroing all 5 would command a 0 m stance as well
+        self._commands[env_ids, :3] *= (~stand).unsqueeze(1).float()
+
+        elapsed = self.episode_length_buf[env_ids].float() * self.step_dt
+        self._cmd_resample_at[env_ids] = elapsed + sample_uniform(
+            *self.cfg.command_resample_s, (num_resets,), self.device
+        )
 
     def _visualize_markers(self) -> None:
         if self._markers is None:
@@ -317,6 +429,17 @@ def pose_match_reward(leg_pos_offset: torch.Tensor) -> torch.Tensor:
     # norm over the 8 leg joints is a shared budget: one joint may swing the full tolerance,
     # or all eight may drift by tolerance/sqrt(8) each. wheels excluded - they spin unbounded. 
     return (torch.norm(leg_pos_offset, dim=1)).float()
+
+#this might break the code 
+def stand_still_penalty(
+    lin_vel_b: torch.Tensor, ang_vel_b: torch.Tensor, commands: torch.Tensor, cmd_threshold: float
+) -> torch.Tensor:
+    # only bites when the command asks for a full stop; zero everywhere else, so it never
+    # fights the tracking terms. linear in speed on purpose - a squared penalty goes flat
+    # near zero, which is exactly where the bot needs pushing to actually settle.
+    still = (torch.norm(commands[:, :2], dim=1) + commands[:, 2].abs()) < cmd_threshold
+    motion = torch.norm(lin_vel_b[:, :2], dim=1) + ang_vel_b[:, 2].abs()
+    return motion * still.float()
 
 
 def stance_width_reward(stance_width: torch.Tensor, target: float, tolerance: float) -> torch.Tensor:
@@ -387,13 +510,11 @@ def compute_rewards(
     target_height: float,
     rew_scale_height: float,
 
-    stance_width: torch.Tensor,
-    stance_width_target: float,
-    stance_width_tolerance: float,
-    rew_scale_stance_width: float,
-
     leg_pos_offset: torch.Tensor,
     rew_scale_pose_match: float,
+
+    stand_still_cmd_threshold: float,
+    rew_scale_stand_still: float,
 
 ) -> torch.Tensor:
     
@@ -403,6 +524,7 @@ def compute_rewards(
         
         + rew_scale_ang_vel * angular_velocity_penalty(ang_vel_b) # evaluate the roll and pitch rate and penalize rapid rotation around the horizontal (X and Y) axes. Formula: ωx² + ωy² 
         + rew_scale_action * action_penalty(actions) # normalization for action, and penalize large action command, like slamming actuators, etc.. Formula : (current_action)²
+        # + rew_scale_stand_still * stand_still_penalty(lin_vel_b, ang_vel_b, commands, stand_still_cmd_threshold) # penalize motion while the command asks for a full stop, so releasing the key brings the bot to rest instead of coasting. Zero whenever a real command is given. Formula: (|v_xy| + |w_z|) if |command| < threshold else 0
         + rew_scale_action_rate * action_rate_penalty(actions, previous_actions)# compare previous action with current action, penalize action if there is rapid change between the two actions. Formula: (current_action - previous_action)²
 
         + rew_scale_height * height_penalty(root_height, target_height)# compare bot height to target height, penalize the difference between the two. Returns a positive magnitude and rew_scale_height is negative, so this deducts. Formula: (current height - target height)²
